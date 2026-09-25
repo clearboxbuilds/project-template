@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Create a new Clearbox Builds project from project-template.
+
+Usage (from anywhere):
+    <path-to>/project-template/bin/clearbox-new-project --name <my-new-project> [--public]
+
+What it does:
+  1. Creates a new GitHub repo <owner>/<name> from the project-template repo, using the
+     GitHub CLI (`gh`). The owner is the same as the template's (e.g. clearboxbuilds).
+  2. Clones it into a folder next to this project-template folder (../<name>).
+  3. Starts a Claude session named "Clearbox: <name>" in that folder, asking it to
+     "set up this project" (the project-setup skill then asks for the name and description).
+
+Why not just copy the project-template folder? A copy keeps the template's .git folder:
+its commit history, and an `origin` remote that still points at project-template, so the
+first `git push` would go to the template repo. Creating from the template on GitHub gives
+a fresh repo with its own history and the right remote.
+
+Note: GitHub copies the template as it is *on GitHub*, so push any template changes first.
+
+Exit code 0 on success, 1 on failure (reason printed to stderr).
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# This script lives in <project-template>/bin/, so the template folder is two levels up,
+# and new projects go into the folder that contains the template folder.
+TEMPLATE_DIR = Path(__file__).resolve().parent.parent
+PROJECTS_DIR = TEMPLATE_DIR.parent
+
+# GitHub fills a new repo from its template in the background, so a clone made right after
+# `gh repo create` can come back empty. We retry the clone this many times, this far apart.
+CLONE_ATTEMPTS = 10
+CLONE_RETRY_DELAY_SECONDS = 2
+
+# First message sent to the new Claude session; it triggers the project-setup skill.
+SETUP_PROMPT = "set up this project"
+
+# GitHub repo names may only contain letters, digits, '.', '-' and '_'.
+VALID_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def fail(msg):
+    """Print a failure message to stderr and exit with code 1."""
+    print(f"FAILED: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(*cmd, cwd=None):
+    """Run a command, returning the CompletedProcess (never raises on a non-zero exit)."""
+    return subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True)
+
+
+def template_repo():
+    """Return (owner, repo) of the template, read from its `origin` remote.
+
+    Handles both remote URL forms:
+      https://github.com/clearboxbuilds/project-template.git
+      git@github.com:clearboxbuilds/project-template.git
+    """
+    r = run("git", "remote", "get-url", "origin", cwd=TEMPLATE_DIR)
+    if r.returncode != 0:
+        fail(f"couldn't read the origin remote of {TEMPLATE_DIR}. Is it a clone of project-template?")
+    match = re.search(r"[:/]([^/:]+)/([^/]+?)(\.git)?/?$", r.stdout.strip())
+    if not match:
+        fail(f"couldn't parse owner/repo from the template's origin remote: {r.stdout.strip()}")
+    return match.group(1), match.group(2)
+
+
+def has_commits(path):
+    """True if the repo at `path` has at least one commit (i.e. the clone isn't empty)."""
+    return run("git", "rev-parse", "--verify", "HEAD", cwd=path).returncode == 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create a new Clearbox Builds project from project-template.")
+    parser.add_argument("--name", required=True, help="repo and folder name, e.g. pantry-pal")
+    parser.add_argument("--public", action="store_true", help="make the GitHub repo public (default: private)")
+    args = parser.parse_args()
+    name = args.name.strip()
+
+    # --- Checks. All of these run before anything is created, locally or on GitHub. ---
+    if not VALID_NAME.match(name) or name in (".", ".."):
+        fail(f"'{name}' isn't a valid repo name. Use letters, digits, '.', '-' and '_' only (e.g. pantry-pal).")
+    owner, template = template_repo()
+    if name == template:
+        fail(f"'{name}' is the template's own name. Pick a name for the new project.")
+    target = PROJECTS_DIR / name
+    if target.exists():
+        fail(f"{target} already exists. Pick another name or move that folder first.")
+    if not shutil.which("gh"):
+        fail("the GitHub CLI (`gh`) isn't installed. Install it (e.g. `brew install gh`) and run `gh auth login`.")
+
+    # --- Step 1: create the repo on GitHub from the template. ---
+    visibility = "--public" if args.public else "--private"
+    new_repo = f"{owner}/{name}"
+    created = run("gh", "repo", "create", new_repo, "--template", f"{owner}/{template}", visibility, cwd=PROJECTS_DIR)
+    if created.returncode != 0:
+        fail(f"`gh repo create` failed, nothing was created:\n{created.stderr.strip()}")
+    print(f"Created GitHub repo {new_repo} ({visibility[2:]}) from {owner}/{template}.")
+
+    # --- Step 2: clone it next to the template, retrying while GitHub finishes filling it. ---
+    for attempt in range(1, CLONE_ATTEMPTS + 1):
+        cloned = run("gh", "repo", "clone", new_repo, str(target), cwd=PROJECTS_DIR)
+        if cloned.returncode == 0 and has_commits(target):
+            break
+        # Clone failed or came back empty. Remove only the folder this attempt just made,
+        # then wait and try again.
+        if target.exists():
+            shutil.rmtree(target)
+        if attempt < CLONE_ATTEMPTS:
+            time.sleep(CLONE_RETRY_DELAY_SECONDS)
+    else:
+        # The loop never hit `break`: every attempt failed. The GitHub repo does exist, so say so.
+        fail(f"{new_repo} was created on GitHub, but cloning it kept failing or coming back empty. "
+             f"Try later: gh repo clone {new_repo} {target}")
+
+    print(f"Cloned into {target}.")
+
+    # --- Step 3: start a named Claude session inside the new project, asking it to run setup. ---
+    # The claude CLI can't pre-fill the prompt box without sending it, so we send the prompt.
+    # With no name or description in it, the project-setup skill asks for both.
+    # A script can't change its parent shell's folder, so instead we start claude *in* the new
+    # folder, replacing this process (os.execvp). Quitting claude returns to the original shell.
+    session_name = f"Clearbox: {name}"
+    if not shutil.which("claude"):
+        # The project already exists, so this isn't a failure: just print the manual steps.
+        print("\n`claude` isn't on your PATH, so start the session yourself:")
+        print(f"  cd {target}")
+        print(f'  claude -n "{session_name}" "{SETUP_PROMPT}"')
+        return
+    print(f'\nStarting Claude ("{session_name}") in {target}...')
+    sys.stdout.flush()  # execvp replaces this process, so flush anything still buffered first
+    os.chdir(target)
+    os.execvp("claude", ["claude", "-n", session_name, SETUP_PROMPT])
+
+
+if __name__ == "__main__":
+    main()
