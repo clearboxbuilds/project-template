@@ -1,6 +1,6 @@
 <img width="1280" height="320" alt="github-readme" src="https://github.com/user-attachments/assets/4b0cbe93-aaf6-4cf6-9e9f-86438c063f8c" />
 
-[![Website](https://img.shields.io/badge/clearboxbuilds.com-C8802F?style=for-the-badge)](https://www.clearboxbuilds.com/builds/<PROJECT:REPO>)
+[![Website](https://img.shields.io/badge/clearboxbuilds.com-C8802F?style=for-the-badge)](https://www.clearboxbuilds.com/builds/<PROJECT:REPO>?utm_source=github&utm_medium=referral&utm_campaign=<PROJECT:REPO>&utm_content=readme-top)
 [![YouTube](https://img.shields.io/twitter/follow/clearboxbuilds?style=for-the-badge&logo=youtube&logoColor=%23FF0000&label=YouTube)](https://www.youtube.com/@clearboxbuilds)
 [![X](https://img.shields.io/twitter/follow/clearboxbuilds?style=for-the-badge&logo=x&logoColor=%23000000&label=Follow)
 ](https://x.com/clearboxbuilds)
